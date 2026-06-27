@@ -22,6 +22,29 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 N8N_WEBHOOK_BASE = os.getenv("N8N_WEBHOOK_BASE")  # e.g. https://your-n8n.com/webhook
 
+PRIORITY_OPTIONS = ["Urgent", "Normal", "Low"]
+PRIORITY_MAP = {
+    "High": "Urgent", "Urgent": "Urgent",
+    "Medium": "Normal", "Normal": "Normal",
+    "Low": "Low",
+}
+
+
+def normalize_task(task: dict) -> dict:
+    """Map button payload fields to what the modal and n8n webhooks expect."""
+    raw_priority = task.get("priority") or "Normal"
+    priority = PRIORITY_MAP.get(raw_priority, "Normal")
+    if priority not in PRIORITY_OPTIONS:
+        priority = "Normal"
+    return {
+        "task_id": task.get("task_id", ""),
+        "title": task.get("title") or task.get("task") or "",
+        "brief": task.get("brief") or "",
+        "assignee": task.get("assignee") or "Unassigned",
+        "priority": priority,
+        "deadline": task.get("deadline") or "",
+    }
+
 
 # ── Slack signature verification ─────────────────────────────────────────────
 
@@ -48,12 +71,18 @@ async def slack_api(method: str, payload: dict):
             headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
             json=payload
         )
-        return resp.json()
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"Slack API error [{method}]: {data.get('error', data)}")
+        return data
 
 
 async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
     """Open a Slack modal so the Founder can edit task fields inline."""
-    await slack_api("views.open", {
+    task = normalize_task({**task, "task_id": task_id or task.get("task_id", "")})
+    priority = task["priority"]
+
+    result = await slack_api("views.open", {
         "trigger_id": trigger_id,
         "view": {
             "type": "modal",
@@ -70,7 +99,7 @@ async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
                     "element": {
                         "type": "plain_text_input",
                         "action_id": "title",
-                        "initial_value": task.get("title", "")
+                        "initial_value": task["title"]
                     }
                 },
                 {
@@ -81,7 +110,7 @@ async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
                         "type": "plain_text_input",
                         "action_id": "brief",
                         "multiline": True,
-                        "initial_value": task.get("brief", "")
+                        "initial_value": task["brief"]
                     }
                 },
                 {
@@ -91,7 +120,7 @@ async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
                     "element": {
                         "type": "plain_text_input",
                         "action_id": "assignee",
-                        "initial_value": task.get("assignee", "")
+                        "initial_value": task["assignee"]
                     }
                 },
                 {
@@ -102,8 +131,8 @@ async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
                         "type": "static_select",
                         "action_id": "priority",
                         "initial_option": {
-                            "text": {"type": "plain_text", "text": task.get("priority", "Normal")},
-                            "value": task.get("priority", "Normal")
+                            "text": {"type": "plain_text", "text": priority},
+                            "value": priority
                         },
                         "options": [
                             {"text": {"type": "plain_text", "text": "Urgent"}, "value": "Urgent"},
@@ -121,12 +150,13 @@ async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
                         "type": "plain_text_input",
                         "action_id": "deadline",
                         "placeholder": {"type": "plain_text", "text": "e.g. Friday, 27 June"},
-                        "initial_value": task.get("deadline", "")
+                        "initial_value": task["deadline"]
                     }
                 }
             ]
         }
     })
+    return result
 
 
 # ── Main interactive endpoint ─────────────────────────────────────────────────
@@ -141,13 +171,13 @@ async def slack_interactive(request: Request):
     body = await request.body()
     timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
     signature = request.headers.get("X-Slack-Signature", "")
-    if not verify_slack_signature(body, timestamp, signature):
+    if not SLACK_SIGNING_SECRET or not verify_slack_signature(body, timestamp, signature):
         raise HTTPException(status_code=403, detail="Invalid Slack signature")
 
-    # Parse payload (Slack sends it as URL-encoded form)
     form = await request.form()
     payload = json.loads(form["payload"])
     payload_type = payload.get("type")
+    print(f"Slack interactive: type={payload_type}")
 
     # ── Modal submission (Edit → Approve) ────────────────────────────────────
     if payload_type == "view_submission":
@@ -172,14 +202,17 @@ async def slack_interactive(request: Request):
         action = payload["actions"][0]
         action_id = action["action_id"]
         action_value = json.loads(action.get("value", "{}"))
-        task_id = action_value.get("task_id", "")
+        task = normalize_task(action_value)
+        task_id = task["task_id"]
         user_id = payload["user"]["id"]
+
+        print(f"Slack action: {action_id} task_id={task_id}")
 
         # — Founder approval buttons —
         if action_id == "approve_task":
             async with httpx.AsyncClient() as client:
                 await client.post(f"{N8N_WEBHOOK_BASE}/task-approved", json={
-                    **action_value, "action": "approve"
+                    **task, "action": "approve"
                 })
             await slack_api("chat.update", {
                 "channel": payload["channel"]["id"],
@@ -191,7 +224,7 @@ async def slack_interactive(request: Request):
         elif action_id == "edit_task":
             await open_edit_modal(
                 trigger_id=payload["trigger_id"],
-                task=action_value,
+                task=task,
                 task_id=task_id
             )
 
