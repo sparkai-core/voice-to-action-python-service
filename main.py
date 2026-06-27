@@ -77,7 +77,26 @@ async def slack_api(method: str, payload: dict):
         return data
 
 
-async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
+async def update_slack_message(channel_id: str, message_ts: str, text: str):
+    """Replace the original interactive message with a status line."""
+    if not channel_id or not message_ts:
+        print("Slack message update skipped: missing channel_id or message_ts")
+        return
+    await slack_api("chat.update", {
+        "channel": channel_id,
+        "ts": message_ts,
+        "text": text,
+        "blocks": [],
+    })
+
+
+async def open_edit_modal(
+    trigger_id: str,
+    task: dict,
+    task_id: str,
+    channel_id: str,
+    message_ts: str,
+):
     """Open a Slack modal so the Founder can edit task fields inline."""
     task = normalize_task({**task, "task_id": task_id or task.get("task_id", "")})
     priority = task["priority"]
@@ -87,7 +106,11 @@ async def open_edit_modal(trigger_id: str, task: dict, task_id: str):
         "view": {
             "type": "modal",
             "callback_id": "edit_task_modal",
-            "private_metadata": json.dumps({"task_id": task_id}),
+            "private_metadata": json.dumps({
+                "task_id": task_id,
+                "channel_id": channel_id,
+                "message_ts": message_ts,
+            }),
             "title": {"type": "plain_text", "text": "Edit Task"},
             "submit": {"type": "plain_text", "text": "Approve"},
             "close": {"type": "plain_text", "text": "Cancel"},
@@ -190,12 +213,17 @@ async def slack_interactive(request: Request):
                 "brief":    values["brief_block"]["brief"]["value"],
                 "assignee": values["assignee_block"]["assignee"]["value"],
                 "priority": values["priority_block"]["priority"]["selected_option"]["value"],
-                "deadline": (values["deadline_block"]["deadline"]["value"] or ""),
+                "deadline": (values.get("deadline_block", {}).get("deadline", {}).get("value") or ""),
                 "action":   "approve"
             }
             async with httpx.AsyncClient() as client:
                 await client.post(f"{N8N_WEBHOOK_BASE}/task-approved", json=edited_task)
-            return JSONResponse(content={})  # Empty = close modal
+            await update_slack_message(
+                meta.get("channel_id", ""),
+                meta.get("message_ts", ""),
+                f"✅ Task approved and sent to assignee.\n*{edited_task['title']}*",
+            )
+            return JSONResponse(content={})
 
     # ── Button actions ────────────────────────────────────────────────────────
     if payload_type == "block_actions":
@@ -214,18 +242,19 @@ async def slack_interactive(request: Request):
                 await client.post(f"{N8N_WEBHOOK_BASE}/task-approved", json={
                     **task, "action": "approve"
                 })
-            await slack_api("chat.update", {
-                "channel": payload["channel"]["id"],
-                "ts": payload["message"]["ts"],
-                "text": "✅ Task approved and sent to assignee.",
-                "blocks": []
-            })
+            await update_slack_message(
+                payload["channel"]["id"],
+                payload["message"]["ts"],
+                "✅ Task approved and sent to assignee.",
+            )
 
         elif action_id == "edit_task":
             await open_edit_modal(
                 trigger_id=payload["trigger_id"],
                 task=task,
-                task_id=task_id
+                task_id=task_id,
+                channel_id=payload["channel"]["id"],
+                message_ts=payload["message"]["ts"],
             )
 
         elif action_id == "reject_task":
@@ -233,12 +262,11 @@ async def slack_interactive(request: Request):
                 await client.post(f"{N8N_WEBHOOK_BASE}/task-rejected", json={
                     "task_id": task_id
                 })
-            await slack_api("chat.update", {
-                "channel": payload["channel"]["id"],
-                "ts": payload["message"]["ts"],
-                "text": "🔄 Task sent back for regeneration.",
-                "blocks": []
-            })
+            await update_slack_message(
+                payload["channel"]["id"],
+                payload["message"]["ts"],
+                "🔄 Task sent back for regeneration.",
+            )
 
         # — Team member status buttons —
         elif action_id == "mark_in_progress":
@@ -248,12 +276,11 @@ async def slack_interactive(request: Request):
                     "status": "In Progress",
                     "user_id": user_id
                 })
-            await slack_api("chat.update", {
-                "channel": payload["channel"]["id"],
-                "ts": payload["message"]["ts"],
-                "text": f"🔵 Marked as *In Progress*. Good luck!",
-                "blocks": []
-            })
+            await update_slack_message(
+                payload["channel"]["id"],
+                payload["message"]["ts"],
+                "🔵 Marked as *In Progress*. Good luck!",
+            )
 
         elif action_id == "mark_done":
             async with httpx.AsyncClient() as client:
@@ -262,12 +289,11 @@ async def slack_interactive(request: Request):
                     "status": "Done",
                     "user_id": user_id
                 })
-            await slack_api("chat.update", {
-                "channel": payload["channel"]["id"],
-                "ts": payload["message"]["ts"],
-                "text": "✅ Marked as *Done*. Great work!",
-                "blocks": []
-            })
+            await update_slack_message(
+                payload["channel"]["id"],
+                payload["message"]["ts"],
+                "✅ Marked as *Done*. Great work!",
+            )
 
         return JSONResponse(content={})
 
