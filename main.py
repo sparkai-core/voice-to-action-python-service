@@ -310,6 +310,113 @@ async def update_message_after_task_action(
         print(f"Failed to update founder message for brief={match_brief!r}")
 
 
+def is_status_action_block(actions_block: dict) -> bool:
+    """True if this actions block has Mark In Progress / Mark Done buttons."""
+    action_ids = {el.get("action_id") for el in actions_block.get("elements", [])}
+    return "mark_in_progress" in action_ids or "mark_done" in action_ids
+
+
+def mark_assignee_task_in_blocks(
+    blocks: list,
+    target_brief: str,
+    status_line: str,
+    remove_buttons: bool,
+) -> list | None:
+    """
+    Update assignee DM / #task-log task messages (section → divider? → actions).
+    remove_buttons=False keeps buttons (In Progress); True removes them (Done).
+    """
+    target = target_brief.strip()
+    if not blocks or not target:
+        return None
+
+    updated: list = []
+    matched = False
+    i = 0
+    while i < len(blocks):
+        block = blocks[i]
+        if block.get("type") == "section":
+            section_text = block.get("text", {}).get("text", "")
+            actions_idx = i + 1
+            if actions_idx < len(blocks) and blocks[actions_idx].get("type") == "divider":
+                actions_idx += 1
+            if (
+                actions_idx < len(blocks)
+                and blocks[actions_idx].get("type") == "actions"
+                and is_status_action_block(blocks[actions_idx])
+            ):
+                actions_block = blocks[actions_idx]
+                if actions_block_matches_brief(actions_block, section_text, target):
+                    matched = True
+                    updated.append({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"{section_text}\n\n{status_line}",
+                        },
+                    })
+                    if actions_idx > i + 1:
+                        updated.append(blocks[i + 1])  # divider
+                    if not remove_buttons:
+                        updated.append(actions_block)
+                    i = actions_idx + 1
+                    continue
+
+        updated.append(block)
+        i += 1
+
+    return updated if matched else None
+
+
+async def update_message_after_status_action(
+    channel_id: str,
+    message_ts: str,
+    brief: str,
+    title: str,
+    status: str,
+):
+    """Update assignee DM / #task-log after In Progress or Done."""
+    status_lines = {
+        "In Progress": "🔵 *Status: In Progress*",
+        "Done": "✅ *Status: Done* — great work!",
+    }
+    status_line = status_lines.get(status, f"*Status: {status}*")
+    remove_buttons = status == "Done"
+    fallback_text = f"{status_line}\n*{title or brief}*"
+
+    current_blocks = await fetch_message_blocks(channel_id, message_ts)
+    new_blocks = mark_assignee_task_in_blocks(
+        current_blocks, brief, status_line, remove_buttons
+    )
+
+    if new_blocks is not None:
+        ok = await update_slack_message(channel_id, message_ts, fallback_text, new_blocks)
+    else:
+        print(f"Could not match assignee task block for brief={brief!r}; replacing message")
+        ok = await update_slack_message(channel_id, message_ts, fallback_text)
+
+    if not ok:
+        print(f"Failed to update status message for brief={brief!r}")
+
+
+async def send_task_status_to_n8n(brief: str, title: str, status: str, user_id: str) -> bool:
+    """Notify n8n to update Airtable status and post to #task-log."""
+    payload = {
+        "brief": brief,
+        "title": title,
+        "status": status,
+        "user_id": user_id,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{N8N_WEBHOOK_BASE}/task-status", json=payload)
+            print(f"n8n task-status ({status}): status={resp.status_code} brief={brief!r}")
+            return resp.status_code < 400
+    except Exception as exc:
+        print(f"n8n task-status webhook failed ({status}): {exc}")
+        return False
+
+
 async def send_task_approved_to_n8n(task: dict):
     """Notify n8n that a task was approved."""
     try:
@@ -603,31 +710,29 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
             )
 
         elif action_id == "mark_in_progress":
-            async with httpx.AsyncClient() as client:
-                await client.post(f"{N8N_WEBHOOK_BASE}/task-status", json={
-                    "brief": brief,
-                    "title": task["title"],
-                    "status": "In Progress",
-                    "user_id": user_id
-                })
-            await update_slack_message(
+            if not brief:
+                from_msg = extract_from_message_blocks(payload)
+                brief = from_msg["brief"] or task["title"]
+            await send_task_status_to_n8n(brief, task["title"], "In Progress", user_id)
+            await update_message_after_status_action(
                 payload["channel"]["id"],
                 payload["message"]["ts"],
-                "🔵 Marked as *In Progress*. Good luck!",
+                brief,
+                task["title"],
+                "In Progress",
             )
 
         elif action_id == "mark_done":
-            async with httpx.AsyncClient() as client:
-                await client.post(f"{N8N_WEBHOOK_BASE}/task-status", json={
-                    "brief": brief,
-                    "title": task["title"],
-                    "status": "Done",
-                    "user_id": user_id
-                })
-            await update_slack_message(
+            if not brief:
+                from_msg = extract_from_message_blocks(payload)
+                brief = from_msg["brief"] or task["title"]
+            await send_task_status_to_n8n(brief, task["title"], "Done", user_id)
+            await update_message_after_status_action(
                 payload["channel"]["id"],
                 payload["message"]["ts"],
-                "✅ Marked as *Done*. Great work!",
+                brief,
+                task["title"],
+                "Done",
             )
 
         return JSONResponse(content={})
