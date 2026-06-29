@@ -9,6 +9,7 @@ import json
 import hmac
 import hashlib
 import time
+import re
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import httpx
@@ -30,6 +31,32 @@ PRIORITY_MAP = {
 }
 
 
+def extract_from_message_blocks(payload: dict) -> dict:
+    """Parse brief/title from Slack message blocks when button value omits them."""
+    result = {"brief": "", "title": ""}
+    for block in payload.get("message", {}).get("blocks", []):
+        if block.get("type") != "section":
+            continue
+        text = block.get("text", {}).get("text", "")
+        if not result["title"]:
+            title_match = re.match(r"\*([^*]+)\*", text)
+            if title_match:
+                candidate = title_match.group(1).strip()
+                if candidate != "📝 Task:":
+                    result["title"] = candidate
+            task_match = re.search(r"\*📝 Task:\*\s*(.+?)(?:\n\n|$)", text)
+            if task_match:
+                result["title"] = task_match.group(1).strip()
+        brief_match = re.search(
+            r"(?:📄 )?\*Brief:\*\s*(.+?)(?:\n\n|\n👤|\n🔴|\n🟡|\n🟢|\n📅|\n🆔|$)",
+            text,
+            re.DOTALL,
+        )
+        if brief_match:
+            result["brief"] = brief_match.group(1).strip()
+    return result
+
+
 def normalize_task(task: dict) -> dict:
     """Map button payload fields to what the modal and n8n webhooks expect."""
     raw_priority = task.get("priority") or "Normal"
@@ -44,6 +71,20 @@ def normalize_task(task: dict) -> dict:
         "priority": priority,
         "deadline": task.get("deadline") or "",
     }
+
+
+def resolve_task(action_value: dict, payload: dict) -> dict:
+    """Resolve brief/title from button value, with fallback to the Slack message text."""
+    task = normalize_task(action_value)
+    if not task["brief"] or not task["title"]:
+        from_msg = extract_from_message_blocks(payload)
+        if not task["brief"]:
+            task["brief"] = from_msg["brief"]
+        if not task["title"]:
+            task["title"] = from_msg["title"]
+    if not task["brief"] and task["title"]:
+        task["brief"] = task["title"]
+    return task
 
 
 # ── Slack signature verification ─────────────────────────────────────────────
@@ -227,11 +268,11 @@ async def slack_interactive(request: Request):
         action = payload["actions"][0]
         action_id = action["action_id"]
         action_value = json.loads(action.get("value", "{}"))
-        task = normalize_task(action_value)
+        task = resolve_task(action_value, payload)
         brief = task["brief"]
         user_id = payload["user"]["id"]
 
-        print(f"Slack action: {action_id} brief={brief[:50]!r}")
+        print(f"Slack action: {action_id} brief={brief!r}")
 
         if action_id == "approve_task":
             async with httpx.AsyncClient() as client:
@@ -267,6 +308,7 @@ async def slack_interactive(request: Request):
             async with httpx.AsyncClient() as client:
                 await client.post(f"{N8N_WEBHOOK_BASE}/task-status", json={
                     "brief": brief,
+                    "title": task["title"],
                     "status": "In Progress",
                     "user_id": user_id
                 })
@@ -280,6 +322,7 @@ async def slack_interactive(request: Request):
             async with httpx.AsyncClient() as client:
                 await client.post(f"{N8N_WEBHOOK_BASE}/task-status", json={
                     "brief": brief,
+                    "title": task["title"],
                     "status": "Done",
                     "user_id": user_id
                 })
