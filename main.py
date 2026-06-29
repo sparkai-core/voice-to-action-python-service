@@ -609,6 +609,22 @@ async def slack_user_display_name(user_id: str) -> str:
     return "Unknown"
 
 
+def deadline_for_modal(deadline: str) -> str:
+    """Return a real deadline for the modal, or empty so the placeholder shows."""
+    value = (deadline or "").strip()
+    if not value or value.lower() in ("not specified", "none", "n/a", "-"):
+        return ""
+    return value
+
+
+def normalize_deadline_input(deadline: str) -> str:
+    """Clean deadline from modal submit."""
+    value = (deadline or "").strip()
+    if value.lower() in ("not specified", "none", "n/a", "-"):
+        return ""
+    return value
+
+
 async def build_assignee_select(task: dict) -> dict:
     """Slack users_select — searchable list of workspace members."""
     element = {
@@ -622,7 +638,6 @@ async def build_assignee_select(task: dict) -> dict:
     return {
         "type": "input",
         "block_id": "assignee_block",
-        "optional": True,
         "label": {"type": "plain_text", "text": "Assigned To"},
         "element": element,
     }
@@ -638,6 +653,14 @@ async def open_edit_modal(
     task = normalize_task(task)
     priority = task["priority"]
     assignee_block = await build_assignee_select(task)
+    deadline_value = deadline_for_modal(task["deadline"])
+    deadline_element = {
+        "type": "plain_text_input",
+        "action_id": "deadline",
+        "placeholder": {"type": "plain_text", "text": "DD/MM/YYYY"},
+    }
+    if deadline_value:
+        deadline_element["initial_value"] = deadline_value
 
     blocks = [
         {
@@ -683,14 +706,9 @@ async def open_edit_modal(
         {
             "type": "input",
             "block_id": "deadline_block",
-            "label": {"type": "plain_text", "text": "Deadline (optional)"},
+            "label": {"type": "plain_text", "text": "Deadline"},
             "optional": True,
-            "element": {
-                "type": "plain_text_input",
-                "action_id": "deadline",
-                "placeholder": {"type": "plain_text", "text": "e.g. Friday, 27 June"},
-                "initial_value": task["deadline"]
-            }
+            "element": deadline_element,
         }
     ]
 
@@ -744,7 +762,9 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 "assignee": "",
                 "assignee_slack_id": assignee_slack_id,
                 "priority": values["priority_block"]["priority"]["selected_option"]["value"],
-                "deadline": (values.get("deadline_block", {}).get("deadline", {}).get("value") or ""),
+                "deadline": normalize_deadline_input(
+                    values.get("deadline_block", {}).get("deadline", {}).get("value") or ""
+                ),
             }
             original_brief = meta.get("original_brief") or meta.get("brief") or edited_task["brief"]
             channel_id = meta.get("channel_id", "")
