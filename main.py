@@ -131,6 +131,35 @@ async def update_slack_message(channel_id: str, message_ts: str, text: str):
     })
 
 
+def member_display_name(member: dict) -> str:
+    """Best display name from a Slack member/users.info object."""
+    profile = member.get("profile", {})
+    for key in ("real_name", "display_name"):
+        val = (profile.get(key) or member.get(key) or "").strip()
+        if val:
+            return val
+    username = (member.get("name") or "").strip()
+    return username
+
+
+async def fetch_slack_members() -> list[dict]:
+    """Paginated workspace member list (requires users:read)."""
+    members: list[dict] = []
+    cursor: str | None = None
+    while True:
+        payload: dict = {"limit": 200}
+        if cursor:
+            payload["cursor"] = cursor
+        data = await slack_api("users.list", payload)
+        if not data.get("ok"):
+            break
+        members.extend(data.get("members", []))
+        cursor = data.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            break
+    return members
+
+
 async def resolve_slack_user_id(assignee: str) -> str | None:
     """Map assignee name or Slack ID to a user ID for users_select initial value."""
     value = (assignee or "").strip()
@@ -138,11 +167,8 @@ async def resolve_slack_user_id(assignee: str) -> str | None:
         return None
     if re.match(r"^U[A-Z0-9]+$", value, re.I):
         return value
-    data = await slack_api("users.list", {"limit": 200})
-    if not data.get("ok"):
-        return None
     target = value.lower()
-    for member in data.get("members", []):
+    for member in await fetch_slack_members():
         if member.get("deleted") or member.get("is_bot"):
             continue
         profile = member.get("profile", {})
@@ -161,18 +187,23 @@ async def slack_user_display_name(user_id: str) -> str:
     """Get a human-readable name for Airtable / Slack messages."""
     if not user_id:
         return "Unassigned"
+    user_id = user_id.strip()
+
     data = await slack_api("users.info", {"user": user_id})
-    if not data.get("ok"):
-        return user_id
-    user = data["user"]
-    profile = user.get("profile", {})
-    return (
-        profile.get("display_name")
-        or profile.get("real_name")
-        or user.get("real_name")
-        or user.get("name")
-        or user_id
-    )
+    if data.get("ok"):
+        name = member_display_name(data["user"])
+        if name:
+            return name
+
+    for member in await fetch_slack_members():
+        if member.get("id") == user_id:
+            name = member_display_name(member)
+            if name:
+                return name
+            break
+
+    print(f"Could not resolve display name for Slack user {user_id}")
+    return "Unknown"
 
 
 async def build_assignee_select(task: dict) -> dict:
