@@ -316,6 +316,48 @@ def is_status_action_block(actions_block: dict) -> bool:
     return "mark_in_progress" in action_ids or "mark_done" in action_ids
 
 
+def mark_status_in_blocks_by_action(
+    blocks: list,
+    clicked_action_id: str,
+    status_line: str,
+    remove_buttons: bool,
+) -> list | None:
+    """Update the task section tied to the button the user clicked."""
+    if not blocks:
+        return None
+
+    for i, block in enumerate(blocks):
+        if block.get("type") != "actions":
+            continue
+        element_ids = {el.get("action_id") for el in block.get("elements", [])}
+        if clicked_action_id not in element_ids:
+            continue
+
+        section_idx = i - 1
+        if section_idx >= 0 and blocks[section_idx].get("type") == "divider":
+            section_idx -= 1
+        if section_idx < 0 or blocks[section_idx].get("type") != "section":
+            continue
+
+        section_text = blocks[section_idx].get("text", {}).get("text", "")
+        updated = list(blocks[:section_idx])
+        updated.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{section_text}\n\n{status_line}",
+            },
+        })
+        if section_idx + 1 < i and blocks[section_idx + 1].get("type") == "divider":
+            updated.append(blocks[section_idx + 1])
+        if not remove_buttons:
+            updated.append(block)
+        updated.extend(blocks[i + 1:])
+        return updated
+
+    return None
+
+
 def mark_assignee_task_in_blocks(
     blocks: list,
     target_brief: str,
@@ -374,6 +416,8 @@ async def update_message_after_status_action(
     brief: str,
     title: str,
     status: str,
+    current_blocks: list | None = None,
+    clicked_action_id: str = "",
 ):
     """Update assignee DM / #task-log after In Progress or Done."""
     status_lines = {
@@ -384,19 +428,70 @@ async def update_message_after_status_action(
     remove_buttons = status == "Done"
     fallback_text = f"{status_line}\n*{title or brief}*"
 
-    current_blocks = await fetch_message_blocks(channel_id, message_ts)
-    new_blocks = mark_assignee_task_in_blocks(
-        current_blocks, brief, status_line, remove_buttons
-    )
+    blocks = current_blocks
+    if not blocks:
+        blocks = await fetch_message_blocks(channel_id, message_ts)
+
+    new_blocks = None
+    if clicked_action_id:
+        new_blocks = mark_status_in_blocks_by_action(
+            blocks, clicked_action_id, status_line, remove_buttons
+        )
+    if new_blocks is None:
+        new_blocks = mark_assignee_task_in_blocks(
+            blocks, brief, status_line, remove_buttons
+        )
 
     if new_blocks is not None:
         ok = await update_slack_message(channel_id, message_ts, fallback_text, new_blocks)
     else:
-        print(f"Could not match assignee task block for brief={brief!r}; replacing message")
-        ok = await update_slack_message(channel_id, message_ts, fallback_text)
+        print(f"Could not match assignee task block for brief={brief!r}; keeping buttons in fallback")
+        ok = await update_slack_message(channel_id, message_ts, fallback_text, _status_fallback_blocks(
+            blocks, status_line, remove_buttons, clicked_action_id
+        ))
 
     if not ok:
         print(f"Failed to update status message for brief={brief!r}")
+
+
+def _status_fallback_blocks(
+    blocks: list,
+    status_line: str,
+    remove_buttons: bool,
+    clicked_action_id: str,
+) -> list:
+    """Last resort: append status line and preserve action buttons when possible."""
+    if not blocks:
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": status_line}}]
+
+    if clicked_action_id:
+        rebuilt = mark_status_in_blocks_by_action(
+            blocks, clicked_action_id, status_line, remove_buttons
+        )
+        if rebuilt:
+            return rebuilt
+
+    actions = next((b for b in blocks if b.get("type") == "actions"), None)
+    section = next((b for b in blocks if b.get("type") == "section"), None)
+    header = next((b for b in blocks if b.get("type") == "header"), None)
+    divider = next((b for b in blocks if b.get("type") == "divider"), None)
+
+    result = []
+    if header:
+        result.append(header)
+    if section:
+        text = section.get("text", {}).get("text", "")
+        result.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"{text}\n\n{status_line}"},
+        })
+    else:
+        result.append({"type": "section", "text": {"type": "mrkdwn", "text": status_line}})
+    if divider:
+        result.append(divider)
+    if actions and not remove_buttons:
+        result.append(actions)
+    return result
 
 
 async def send_task_status_to_n8n(brief: str, title: str, status: str, user_id: str) -> bool:
@@ -720,6 +815,8 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 brief,
                 task["title"],
                 "In Progress",
+                current_blocks=payload.get("message", {}).get("blocks", []),
+                clicked_action_id=action_id,
             )
 
         elif action_id == "mark_done":
@@ -733,6 +830,8 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 brief,
                 task["title"],
                 "Done",
+                current_blocks=payload.get("message", {}).get("blocks", []),
+                clicked_action_id=action_id,
             )
 
         return JSONResponse(content={})
