@@ -143,7 +143,56 @@ def task_brief_from_button_value(value: str) -> str:
         return ""
 
 
-def mark_task_in_blocks(blocks: list, target_brief: str, status_line: str) -> list | None:
+def format_task_section(task: dict) -> str:
+    """Render a task section block matching Workflow 1 layout."""
+    priority = task.get("priority") or "Normal"
+    emoji = {"Urgent": "🔴", "Normal": "🟡", "Low": "🟢"}.get(priority, "🟡")
+    assignee = task.get("assignee") or "Unassigned"
+    if assignee == "Unassigned" and task.get("assignee_slack_id"):
+        assignee = f"<@{task['assignee_slack_id']}>"
+    deadline = task.get("deadline") or "Not specified"
+    title = task.get("title") or task.get("brief") or "Untitled task"
+    brief = task.get("brief") or title
+    return (
+        f"*📝 Task:* {title}\n\n"
+        f"📄 *Brief:* {brief}\n\n"
+        f"👤 *Assignee:* {assignee}\n\n"
+        f"{emoji} *Priority:* {priority}\n\n"
+        f"📅 *Deadline:* {deadline}"
+    )
+
+
+def briefs_for_actions_block(actions_block: dict) -> set[str]:
+    briefs = set()
+    for el in actions_block.get("elements", []):
+        val = task_brief_from_button_value(el.get("value", ""))
+        if val:
+            briefs.add(val)
+    return briefs
+
+
+def actions_block_matches_brief(actions_block: dict, section_text: str, target: str) -> bool:
+    """Match a task's action buttons even if the brief was edited in the modal."""
+    target = target.strip()
+    if not target:
+        return False
+    briefs = briefs_for_actions_block(actions_block)
+    if target in briefs:
+        return True
+    for val in briefs:
+        if val in target or target in val:
+            return True
+        if val in section_text or target in section_text:
+            return True
+    return False
+
+
+def mark_task_in_blocks(
+    blocks: list,
+    target_brief: str,
+    status_line: str,
+    task_details: dict | None = None,
+) -> list | None:
     """
     Remove Approve/Edit/Reject buttons for one task; leave other tasks unchanged.
     Returns updated blocks, or None if the message could not be matched.
@@ -163,18 +212,15 @@ def mark_task_in_blocks(blocks: list, target_brief: str, status_line: str) -> li
             and blocks[i + 1].get("type") == "actions"
         ):
             actions_block = blocks[i + 1]
-            briefs = {
-                task_brief_from_button_value(el.get("value", ""))
-                for el in actions_block.get("elements", [])
-            }
-            if target in briefs:
+            section_text = block.get("text", {}).get("text", "")
+            if actions_block_matches_brief(actions_block, section_text, target):
                 matched = True
-                section_text = block.get("text", {}).get("text", "")
+                body = format_task_section(task_details) if task_details else section_text
                 updated.append({
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"{section_text}\n\n{status_line}",
+                        "text": f"{body}\n\n{status_line}",
                     },
                 })
                 i += 2
@@ -222,9 +268,10 @@ async def update_slack_message(channel_id: str, message_ts: str, text: str, bloc
 async def update_message_after_task_action(
     channel_id: str,
     message_ts: str,
-    brief: str,
+    match_brief: str,
     title: str,
     action: str,
+    task_details: dict | None = None,
 ):
     """Update founder-voice message after approve/reject — one task at a time."""
     status_lines = {
@@ -232,10 +279,13 @@ async def update_message_after_task_action(
         "rejected": "❌ *Rejected* — sent back for regeneration.",
     }
     status_line = status_lines.get(action, "✅ *Updated*")
-    fallback_text = f"{status_line}\n*{title or brief}*"
+    display_title = (task_details or {}).get("title") or title or match_brief
+    fallback_text = f"{status_line}\n*{display_title}*"
 
     current_blocks = await fetch_message_blocks(channel_id, message_ts)
-    new_blocks = mark_task_in_blocks(current_blocks, brief, status_line)
+    new_blocks = mark_task_in_blocks(
+        current_blocks, match_brief, status_line, task_details
+    )
 
     if new_blocks is not None:
         if not message_has_pending_actions(new_blocks):
@@ -253,36 +303,33 @@ async def update_message_after_task_action(
                         break
         ok = await update_slack_message(channel_id, message_ts, fallback_text, new_blocks)
     else:
+        print(f"Could not match task block for brief={match_brief!r}; replacing whole message")
         ok = await update_slack_message(channel_id, message_ts, fallback_text)
 
     if not ok:
-        print(f"Failed to update founder message for brief={brief!r}")
+        print(f"Failed to update founder message for brief={match_brief!r}")
 
 
-async def process_edit_approval(edited_task: dict, channel_id: str, message_ts: str):
-    """Background work for Edit → Approve (must not block Slack's 3s modal timeout)."""
-    assignee_slack_id = edited_task.get("assignee_slack_id", "")
-    if assignee_slack_id and not edited_task.get("assignee"):
-        edited_task["assignee"] = await slack_user_display_name(assignee_slack_id)
-    if not edited_task.get("assignee"):
-        edited_task["assignee"] = "Unassigned"
-
+async def send_task_approved_to_n8n(task: dict):
+    """Notify n8n that a task was approved."""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await client.post(f"{N8N_WEBHOOK_BASE}/task-approved", json={
-                **edited_task,
-                "action": "approve",
-            })
+            resp = await client.post(
+                f"{N8N_WEBHOOK_BASE}/task-approved",
+                json={**task, "action": "approve"},
+            )
+            print(f"n8n task-approved: status={resp.status_code}")
     except Exception as exc:
         print(f"n8n task-approved webhook failed: {exc}")
 
-    await update_message_after_task_action(
-        channel_id,
-        message_ts,
-        edited_task["brief"],
-        edited_task["title"],
-        "approved",
-    )
+
+async def finalize_edit_approval(edited_task: dict):
+    """Resolve assignee name for Airtable, then notify n8n."""
+    if edited_task.get("assignee_slack_id"):
+        edited_task["assignee"] = await slack_user_display_name(edited_task["assignee_slack_id"])
+    if not edited_task.get("assignee"):
+        edited_task["assignee"] = "Unassigned"
+    await send_task_approved_to_n8n(edited_task)
 
 
 def member_display_name(member: dict) -> str:
@@ -451,7 +498,7 @@ async def open_edit_modal(
             "type": "modal",
             "callback_id": "edit_task_modal",
             "private_metadata": json.dumps({
-                "brief": task["brief"],
+                "original_brief": task["brief"],
                 "channel_id": channel_id,
                 "message_ts": message_ts,
             }),
@@ -497,12 +544,19 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 "priority": values["priority_block"]["priority"]["selected_option"]["value"],
                 "deadline": (values.get("deadline_block", {}).get("deadline", {}).get("value") or ""),
             }
-            background_tasks.add_task(
-                process_edit_approval,
-                edited_task,
-                meta.get("channel_id", ""),
-                meta.get("message_ts", ""),
+            original_brief = meta.get("original_brief") or meta.get("brief") or edited_task["brief"]
+            channel_id = meta.get("channel_id", "")
+            message_ts = meta.get("message_ts", "")
+
+            await update_message_after_task_action(
+                channel_id,
+                message_ts,
+                original_brief,
+                edited_task["title"],
+                "approved",
+                task_details=edited_task,
             )
+            background_tasks.add_task(finalize_edit_approval, edited_task)
             return JSONResponse(content={})
 
     # ── Button actions ────────────────────────────────────────────────────────
@@ -517,17 +571,15 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
         print(f"Slack action: {action_id} brief={brief!r}")
 
         if action_id == "approve_task":
-            async with httpx.AsyncClient() as client:
-                await client.post(f"{N8N_WEBHOOK_BASE}/task-approved", json={
-                    **task, "action": "approve"
-                })
             await update_message_after_task_action(
                 payload["channel"]["id"],
                 payload["message"]["ts"],
                 brief,
                 task["title"],
                 "approved",
+                task_details=task,
             )
+            background_tasks.add_task(send_task_approved_to_n8n, dict(task))
 
         elif action_id == "edit_task":
             await open_edit_modal(
