@@ -131,6 +131,69 @@ async def update_slack_message(channel_id: str, message_ts: str, text: str):
     })
 
 
+async def resolve_slack_user_id(assignee: str) -> str | None:
+    """Map assignee name or Slack ID to a user ID for users_select initial value."""
+    value = (assignee or "").strip()
+    if not value or value.lower() == "unassigned":
+        return None
+    if re.match(r"^U[A-Z0-9]+$", value, re.I):
+        return value
+    data = await slack_api("users.list", {"limit": 200})
+    if not data.get("ok"):
+        return None
+    target = value.lower()
+    for member in data.get("members", []):
+        if member.get("deleted") or member.get("is_bot"):
+            continue
+        profile = member.get("profile", {})
+        candidates = [
+            member.get("real_name", ""),
+            member.get("name", ""),
+            profile.get("display_name", ""),
+            profile.get("real_name", ""),
+        ]
+        if any(c and c.lower() == target for c in candidates):
+            return member["id"]
+    return None
+
+
+async def slack_user_display_name(user_id: str) -> str:
+    """Get a human-readable name for Airtable / Slack messages."""
+    if not user_id:
+        return "Unassigned"
+    data = await slack_api("users.info", {"user": user_id})
+    if not data.get("ok"):
+        return user_id
+    user = data["user"]
+    profile = user.get("profile", {})
+    return (
+        profile.get("display_name")
+        or profile.get("real_name")
+        or user.get("real_name")
+        or user.get("name")
+        or user_id
+    )
+
+
+async def build_assignee_select(task: dict) -> dict:
+    """Slack users_select — searchable list of workspace members."""
+    element = {
+        "type": "users_select",
+        "action_id": "assignee",
+        "placeholder": {"type": "plain_text", "text": "Select a team member"},
+    }
+    initial_user = await resolve_slack_user_id(task.get("assignee", ""))
+    if initial_user:
+        element["initial_user"] = initial_user
+    return {
+        "type": "input",
+        "block_id": "assignee_block",
+        "optional": True,
+        "label": {"type": "plain_text", "text": "Assigned To"},
+        "element": element,
+    }
+
+
 async def open_edit_modal(
     trigger_id: str,
     task: dict,
@@ -140,6 +203,62 @@ async def open_edit_modal(
     """Open a Slack modal so the Founder can edit task fields inline."""
     task = normalize_task(task)
     priority = task["priority"]
+    assignee_block = await build_assignee_select(task)
+
+    blocks = [
+        {
+            "type": "input",
+            "block_id": "title_block",
+            "label": {"type": "plain_text", "text": "Task Title"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "title",
+                "initial_value": task["title"]
+            }
+        },
+        {
+            "type": "input",
+            "block_id": "brief_block",
+            "label": {"type": "plain_text", "text": "Brief (primary key)"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "brief",
+                "multiline": True,
+                "initial_value": task["brief"]
+            }
+        },
+        assignee_block,
+        {
+            "type": "input",
+            "block_id": "priority_block",
+            "label": {"type": "plain_text", "text": "Priority"},
+            "element": {
+                "type": "static_select",
+                "action_id": "priority",
+                "initial_option": {
+                    "text": {"type": "plain_text", "text": priority},
+                    "value": priority
+                },
+                "options": [
+                    {"text": {"type": "plain_text", "text": "Urgent"}, "value": "Urgent"},
+                    {"text": {"type": "plain_text", "text": "Normal"}, "value": "Normal"},
+                    {"text": {"type": "plain_text", "text": "Low"},    "value": "Low"}
+                ]
+            }
+        },
+        {
+            "type": "input",
+            "block_id": "deadline_block",
+            "label": {"type": "plain_text", "text": "Deadline (optional)"},
+            "optional": True,
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "deadline",
+                "placeholder": {"type": "plain_text", "text": "e.g. Friday, 27 June"},
+                "initial_value": task["deadline"]
+            }
+        }
+    ]
 
     result = await slack_api("views.open", {
         "trigger_id": trigger_id,
@@ -154,69 +273,7 @@ async def open_edit_modal(
             "title": {"type": "plain_text", "text": "Edit Task"},
             "submit": {"type": "plain_text", "text": "Approve"},
             "close": {"type": "plain_text", "text": "Cancel"},
-            "blocks": [
-                {
-                    "type": "input",
-                    "block_id": "title_block",
-                    "label": {"type": "plain_text", "text": "Task Title"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "title",
-                        "initial_value": task["title"]
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "brief_block",
-                    "label": {"type": "plain_text", "text": "Brief (primary key)"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "brief",
-                        "multiline": True,
-                        "initial_value": task["brief"]
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "assignee_block",
-                    "label": {"type": "plain_text", "text": "Assigned To"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "assignee",
-                        "initial_value": task["assignee"]
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "priority_block",
-                    "label": {"type": "plain_text", "text": "Priority"},
-                    "element": {
-                        "type": "static_select",
-                        "action_id": "priority",
-                        "initial_option": {
-                            "text": {"type": "plain_text", "text": priority},
-                            "value": priority
-                        },
-                        "options": [
-                            {"text": {"type": "plain_text", "text": "Urgent"}, "value": "Urgent"},
-                            {"text": {"type": "plain_text", "text": "Normal"}, "value": "Normal"},
-                            {"text": {"type": "plain_text", "text": "Low"},    "value": "Low"}
-                        ]
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "deadline_block",
-                    "label": {"type": "plain_text", "text": "Deadline (optional)"},
-                    "optional": True,
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "deadline",
-                        "placeholder": {"type": "plain_text", "text": "e.g. Friday, 27 June"},
-                        "initial_value": task["deadline"]
-                    }
-                }
-            ]
+            "blocks": blocks
         }
     })
     return result
@@ -246,10 +303,13 @@ async def slack_interactive(request: Request):
         if payload["view"]["callback_id"] == "edit_task_modal":
             meta = json.loads(payload["view"]["private_metadata"])
             values = payload["view"]["state"]["values"]
+            assignee_slack_id = values["assignee_block"]["assignee"].get("selected_user", "")
+            assignee_name = await slack_user_display_name(assignee_slack_id)
             edited_task = {
                 "title":    values["title_block"]["title"]["value"],
                 "brief":    values["brief_block"]["brief"]["value"],
-                "assignee": values["assignee_block"]["assignee"]["value"],
+                "assignee": assignee_name,
+                "assignee_slack_id": assignee_slack_id,
                 "priority": values["priority_block"]["priority"]["selected_option"]["value"],
                 "deadline": (values.get("deadline_block", {}).get("deadline", {}).get("value") or ""),
                 "action":   "approve"
