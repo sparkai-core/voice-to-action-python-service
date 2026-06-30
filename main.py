@@ -615,24 +615,40 @@ async def send_task_status_to_n8n(brief: str, title: str, status: str, user_id: 
 
 async def send_task_approved_to_n8n(task: dict):
     """Notify n8n that a task was approved."""
+    payload = {k: v for k, v in task.items() if v is not None}
+    payload["action"] = "approve"
+    slack_id = (payload.get("assignee_slack_id") or "").strip()
+    if slack_id:
+        payload["assignee_slack_id"] = slack_id
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{N8N_WEBHOOK_BASE}/task-approved",
-                json={**task, "action": "approve"},
+                json=payload,
             )
-            print(f"n8n task-approved: status={resp.status_code}")
+            print(
+                f"n8n task-approved: status={resp.status_code} "
+                f"brief={payload.get('brief')!r} assignee_slack_id={slack_id!r}"
+            )
     except Exception as exc:
         print(f"n8n task-approved webhook failed: {exc}")
 
 
+async def prepare_approved_task_payload(task: dict) -> dict:
+    """Build webhook payload with Slack user ID for DMs and name for Airtable."""
+    payload = dict(task)
+    slack_id = (payload.get("assignee_slack_id") or "").strip()
+    if slack_id:
+        payload["assignee_slack_id"] = slack_id
+        payload["assignee"] = await slack_user_display_name(slack_id)
+    elif not (payload.get("assignee") or "").strip():
+        payload["assignee"] = "Unassigned"
+    return payload
+
+
 async def finalize_edit_approval(edited_task: dict):
     """Resolve assignee name for Airtable, then notify n8n."""
-    if edited_task.get("assignee_slack_id"):
-        edited_task["assignee"] = await slack_user_display_name(edited_task["assignee_slack_id"])
-    if not edited_task.get("assignee"):
-        edited_task["assignee"] = "Unassigned"
-    await send_task_approved_to_n8n(edited_task)
+    await send_task_approved_to_n8n(await prepare_approved_task_payload(edited_task))
 
 
 def member_display_name(member: dict) -> str:
@@ -889,7 +905,9 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 task_index=task_index,
                 clicked_button_value=meta.get("edit_button_value", ""),
             )
-            background_tasks.add_task(finalize_edit_approval, edited_task)
+            await send_task_approved_to_n8n(
+                await prepare_approved_task_payload(edited_task)
+            )
             return JSONResponse(content={})
 
     # ── Button actions ────────────────────────────────────────────────────────
@@ -918,7 +936,10 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 current_blocks=message_blocks,
                 clicked_button_value=raw_button_value,
             )
-            background_tasks.add_task(send_task_approved_to_n8n, dict(task))
+            background_tasks.add_task(
+                send_task_approved_to_n8n,
+                await prepare_approved_task_payload(dict(task)),
+            )
 
         elif action_id == "edit_task":
             await open_edit_modal(
