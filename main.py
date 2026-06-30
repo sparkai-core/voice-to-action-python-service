@@ -613,6 +613,19 @@ async def send_task_status_to_n8n(brief: str, title: str, status: str, user_id: 
         return False
 
 
+def parse_assignee_field(assignee: str) -> tuple[str, str | None]:
+    """Parse assignee text into (name_hint, slack_user_id)."""
+    value = (assignee or "").strip()
+    if not value or value.lower() == "unassigned":
+        return "", None
+    mention = re.match(r"^<@(U[A-Z0-9]+)>$", value, re.I)
+    if mention:
+        return "", mention.group(1)
+    if re.match(r"^U[A-Z0-9]+$", value, re.I):
+        return "", value
+    return value, None
+
+
 async def send_task_approved_to_n8n(task: dict):
     """Notify n8n that a task was approved."""
     payload = {k: v for k, v in task.items() if v is not None}
@@ -635,20 +648,26 @@ async def send_task_approved_to_n8n(task: dict):
 
 
 async def prepare_approved_task_payload(task: dict) -> dict:
-    """Build webhook payload with Slack user ID for DMs and name for Airtable."""
+    """Resolve Slack user ID + display name — no manual ASSIGNEE_MAP needed."""
     payload = dict(task)
-    slack_id = (payload.get("assignee_slack_id") or "").strip()
+    name_hint, id_from_name = parse_assignee_field(payload.get("assignee", ""))
+    slack_id = (payload.get("assignee_slack_id") or id_from_name or "").strip()
+
+    if not slack_id:
+        lookup = name_hint or (payload.get("assignee") or "").strip()
+        if lookup and lookup.lower() != "unassigned":
+            resolved = await resolve_slack_user_id(lookup)
+            slack_id = resolved or ""
+
     if slack_id:
         payload["assignee_slack_id"] = slack_id
         payload["assignee"] = await slack_user_display_name(slack_id)
-    elif not (payload.get("assignee") or "").strip():
-        payload["assignee"] = "Unassigned"
+    else:
+        payload["assignee_slack_id"] = ""
+        assignee = name_hint or (payload.get("assignee") or "").strip()
+        payload["assignee"] = assignee if assignee else "Unassigned"
+
     return payload
-
-
-async def finalize_edit_approval(edited_task: dict):
-    """Resolve assignee name for Airtable, then notify n8n."""
-    await send_task_approved_to_n8n(await prepare_approved_task_payload(edited_task))
 
 
 def member_display_name(member: dict) -> str:
@@ -936,9 +955,8 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 current_blocks=message_blocks,
                 clicked_button_value=raw_button_value,
             )
-            background_tasks.add_task(
-                send_task_approved_to_n8n,
-                await prepare_approved_task_payload(dict(task)),
+            await send_task_approved_to_n8n(
+                await prepare_approved_task_payload(dict(task))
             )
 
         elif action_id == "edit_task":
