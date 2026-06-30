@@ -626,32 +626,68 @@ def parse_assignee_field(assignee: str) -> tuple[str, str | None]:
     return value, None
 
 
-async def send_task_approved_to_n8n(task: dict):
-    """Notify n8n that a task was approved."""
-    payload = {k: v for k, v in task.items() if v is not None}
-    payload["action"] = "approve"
-    slack_id = (payload.get("assignee_slack_id") or "").strip()
-    if slack_id:
-        payload["assignee_slack_id"] = slack_id
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{N8N_WEBHOOK_BASE}/task-approved",
-                json=payload,
-            )
-            print(
-                f"n8n task-approved: status={resp.status_code} "
-                f"brief={payload.get('brief')!r} assignee_slack_id={slack_id!r}"
-            )
-    except Exception as exc:
-        print(f"n8n task-approved webhook failed: {exc}")
+def extract_selected_user_from_modal(values: dict) -> str:
+    """Read Slack user ID from users_select modal state."""
+    assignee_state = values.get("assignee_block", {}).get("assignee", {})
+    for key in ("selected_user", "selected_conversation"):
+        val = (assignee_state.get(key) or "").strip()
+        if val and re.match(r"^U[A-Z0-9]+$", val, re.I):
+            return val
+    return ""
+
+
+def normalize_person_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+async def resolve_slack_user_id(assignee: str) -> str | None:
+    """Map assignee name or Slack ID to a user ID via users.list (requires users:read)."""
+    value = (assignee or "").strip()
+    if not value or value.lower() == "unassigned":
+        return None
+    if re.match(r"^U[A-Z0-9]+$", value, re.I):
+        return value
+
+    target = value.lower()
+    target_norm = normalize_person_name(value)
+    members = await fetch_slack_members()
+    if not members:
+        print("resolve_slack_user_id: users.list returned no members (check users:read scope)")
+
+    for member in members:
+        if member.get("deleted") or member.get("is_bot"):
+            continue
+        profile = member.get("profile", {})
+        candidates = [
+            member.get("real_name", ""),
+            member.get("name", ""),
+            profile.get("display_name", ""),
+            profile.get("real_name", ""),
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            c = candidate.strip()
+            if c.lower() == target or normalize_person_name(c) == target_norm:
+                return member["id"]
+        first = (member.get("real_name") or profile.get("real_name") or "").strip().split()
+        if first and first[0].lower() == target:
+            return member["id"]
+
+    return None
 
 
 async def prepare_approved_task_payload(task: dict) -> dict:
     """Resolve Slack user ID + display name — no manual ASSIGNEE_MAP needed."""
-    payload = dict(task)
+    payload = {k: v for k, v in dict(task).items() if v is not None}
+    existing_id = (payload.get("assignee_slack_id") or "").strip()
+    if re.match(r"^U[A-Z0-9]+$", existing_id, re.I):
+        payload["assignee_slack_id"] = existing_id
+        payload["assignee"] = await slack_user_display_name(existing_id)
+        return payload
+
     name_hint, id_from_name = parse_assignee_field(payload.get("assignee", ""))
-    slack_id = (payload.get("assignee_slack_id") or id_from_name or "").strip()
+    slack_id = (id_from_name or "").strip()
 
     if not slack_id:
         lookup = name_hint or (payload.get("assignee") or "").strip()
@@ -666,8 +702,34 @@ async def prepare_approved_task_payload(task: dict) -> dict:
         payload["assignee_slack_id"] = ""
         assignee = name_hint or (payload.get("assignee") or "").strip()
         payload["assignee"] = assignee if assignee else "Unassigned"
+        print(
+            f"prepare_approved_task_payload: no Slack ID for assignee={payload['assignee']!r}"
+        )
 
     return payload
+
+
+async def send_task_approved_to_n8n(task: dict):
+    """Notify n8n that a task was approved."""
+    payload = await prepare_approved_task_payload(task)
+    payload["action"] = "approve"
+    payload["assignee_slack_id"] = (payload.get("assignee_slack_id") or "").strip()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{N8N_WEBHOOK_BASE}/task-approved",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            print(
+                f"n8n task-approved: status={resp.status_code} "
+                f"assignee={payload.get('assignee')!r} "
+                f"assignee_slack_id={payload.get('assignee_slack_id')!r}"
+            )
+            if resp.status_code >= 400:
+                print(f"n8n task-approved response: {resp.text[:500]}")
+    except Exception as exc:
+        print(f"n8n task-approved webhook failed: {exc}")
 
 
 def member_display_name(member: dict) -> str:
@@ -697,29 +759,6 @@ async def fetch_slack_members() -> list[dict]:
         if not cursor:
             break
     return members
-
-
-async def resolve_slack_user_id(assignee: str) -> str | None:
-    """Map assignee name or Slack ID to a user ID for users_select initial value."""
-    value = (assignee or "").strip()
-    if not value or value.lower() == "unassigned":
-        return None
-    if re.match(r"^U[A-Z0-9]+$", value, re.I):
-        return value
-    target = value.lower()
-    for member in await fetch_slack_members():
-        if member.get("deleted") or member.get("is_bot"):
-            continue
-        profile = member.get("profile", {})
-        candidates = [
-            member.get("real_name", ""),
-            member.get("name", ""),
-            profile.get("display_name", ""),
-            profile.get("real_name", ""),
-        ]
-        if any(c and c.lower() == target for c in candidates):
-            return member["id"]
-    return None
 
 
 async def slack_user_display_name(user_id: str) -> str:
@@ -895,7 +934,8 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
         if payload["view"]["callback_id"] == "edit_task_modal":
             meta = json.loads(payload["view"]["private_metadata"])
             values = payload["view"]["state"]["values"]
-            assignee_slack_id = values["assignee_block"]["assignee"].get("selected_user", "")
+            assignee_slack_id = extract_selected_user_from_modal(values)
+            print(f"edit modal submit: assignee_slack_id={assignee_slack_id!r}")
             edited_task = {
                 "title":    values["title_block"]["title"]["value"],
                 "brief":    values["brief_block"]["brief"]["value"],
@@ -924,9 +964,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 task_index=task_index,
                 clicked_button_value=meta.get("edit_button_value", ""),
             )
-            await send_task_approved_to_n8n(
-                await prepare_approved_task_payload(edited_task)
-            )
+            await send_task_approved_to_n8n(edited_task)
             return JSONResponse(content={})
 
     # ── Button actions ────────────────────────────────────────────────────────
@@ -955,9 +993,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 current_blocks=message_blocks,
                 clicked_button_value=raw_button_value,
             )
-            await send_task_approved_to_n8n(
-                await prepare_approved_task_payload(dict(task))
-            )
+            await send_task_approved_to_n8n(dict(task))
 
         elif action_id == "edit_task":
             await open_edit_modal(
