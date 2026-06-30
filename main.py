@@ -31,6 +31,39 @@ PRIORITY_MAP = {
 }
 
 
+def extract_task_from_clicked_button(blocks: list, clicked_value: str) -> dict:
+    """Parse brief/title from the section linked to the button that was clicked."""
+    result = {"brief": "", "title": ""}
+    target = (clicked_value or "").strip()
+    if not blocks or not target:
+        return result
+
+    for i, block in enumerate(blocks):
+        if block.get("type") != "actions":
+            continue
+        if not any(el.get("value") == target for el in block.get("elements", [])):
+            continue
+        section_idx = i - 1
+        if section_idx >= 0 and blocks[section_idx].get("type") == "divider":
+            section_idx -= 1
+        if section_idx < 0 or blocks[section_idx].get("type") != "section":
+            return result
+        text = blocks[section_idx].get("text", {}).get("text", "")
+        task_match = re.search(r"\*📝 Task:\*\s*(.+?)(?:\n\n|$)", text)
+        if task_match:
+            result["title"] = task_match.group(1).strip()
+        brief_match = re.search(
+            r"(?:📄 )?\*Brief:\*\s*(.+?)(?:\n\n|\n👤|\n🔴|\n🟡|\n🟢|\n📅|\n🆔|$)",
+            text,
+            re.DOTALL,
+        )
+        if brief_match:
+            result["brief"] = brief_match.group(1).strip()
+        return result
+
+    return result
+
+
 def extract_from_message_blocks(payload: dict) -> dict:
     """Parse brief/title from Slack message blocks when button value omits them."""
     result = {"brief": "", "title": ""}
@@ -64,20 +97,28 @@ def normalize_task(task: dict) -> dict:
     if priority not in PRIORITY_OPTIONS:
         priority = "Normal"
     brief = (task.get("brief") or "").strip()
+    task_index = task.get("task_index")
     return {
         "brief": brief,
         "title": task.get("title") or task.get("task") or "",
         "assignee": task.get("assignee") or "Unassigned",
         "priority": priority,
         "deadline": task.get("deadline") or "",
+        "task_index": task_index if task_index is not None else None,
     }
 
 
 def resolve_task(action_value: dict, payload: dict) -> dict:
-    """Resolve brief/title from button value, with fallback to the Slack message text."""
+    """Resolve brief/title from button value, with fallback to the clicked task section."""
     task = normalize_task(action_value)
     if not task["brief"] or not task["title"]:
-        from_msg = extract_from_message_blocks(payload)
+        clicked = payload.get("actions", [{}])[0].get("value", "")
+        from_msg = extract_task_from_clicked_button(
+            payload.get("message", {}).get("blocks", []),
+            clicked,
+        )
+        if not from_msg["brief"] and not from_msg["title"]:
+            from_msg = extract_from_message_blocks(payload)
         if not task["brief"]:
             task["brief"] = from_msg["brief"]
         if not task["title"]:
@@ -143,6 +184,26 @@ def task_brief_from_button_value(value: str) -> str:
         return ""
 
 
+def is_status_action_block(actions_block: dict) -> bool:
+    """True if this actions block has Mark In Progress / Mark Done buttons."""
+    action_ids = {el.get("action_id") for el in actions_block.get("elements", [])}
+    return "mark_in_progress" in action_ids or "mark_done" in action_ids
+
+
+def is_founder_approval_block(actions_block: dict) -> bool:
+    """True if this actions block has Approve / Edit / Reject buttons."""
+    action_ids = {el.get("action_id") for el in actions_block.get("elements", [])}
+    return "approve_task" in action_ids or "edit_task" in action_ids
+
+
+def task_from_button_value(value: str) -> dict:
+    try:
+        data = json.loads(value or "{}")
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
 def format_task_section(task: dict) -> str:
     """Render a task section block matching Workflow 1 layout."""
     priority = task.get("priority") or "Normal"
@@ -162,29 +223,38 @@ def format_task_section(task: dict) -> str:
     )
 
 
-def briefs_for_actions_block(actions_block: dict) -> set[str]:
-    briefs = set()
+def actions_block_matches_task(
+    actions_block: dict,
+    target_brief: str,
+    target_title: str = "",
+    task_index: int | None = None,
+) -> bool:
+    """Strict match — one task per actions block (no fuzzy substring matching)."""
+    target_brief = target_brief.strip()
+    target_title = (target_title or "").strip()
     for el in actions_block.get("elements", []):
-        val = task_brief_from_button_value(el.get("value", ""))
-        if val:
-            briefs.add(val)
-    return briefs
-
-
-def actions_block_matches_brief(actions_block: dict, section_text: str, target: str) -> bool:
-    """Match a task's action buttons even if the brief was edited in the modal."""
-    target = target.strip()
-    if not target:
-        return False
-    briefs = briefs_for_actions_block(actions_block)
-    if target in briefs:
-        return True
-    for val in briefs:
-        if val in target or target in val:
+        data = task_from_button_value(el.get("value", ""))
+        if task_index is not None and data.get("task_index") == task_index:
             return True
-        if val in section_text or target in section_text:
-            return True
+        btn_brief = (data.get("brief") or "").strip()
+        btn_title = (data.get("title") or "").strip()
+        if target_brief and btn_brief == target_brief:
+            if not target_title or btn_title == target_title:
+                return True
     return False
+
+
+def find_founder_approval_actions_index(blocks: list, action_value: str) -> int | None:
+    """Find the actions block index for the exact button value that was clicked."""
+    target = (action_value or "").strip()
+    if not target:
+        return None
+    for i, block in enumerate(blocks):
+        if block.get("type") != "actions":
+            continue
+        if any(el.get("value") == target for el in block.get("elements", [])):
+            return i
+    return None
 
 
 def mark_task_in_blocks(
@@ -192,13 +262,40 @@ def mark_task_in_blocks(
     target_brief: str,
     status_line: str,
     task_details: dict | None = None,
+    target_title: str = "",
+    task_index: int | None = None,
+    actions_block_index: int | None = None,
 ) -> list | None:
     """
-    Remove Approve/Edit/Reject buttons for one task; leave other tasks unchanged.
-    Returns updated blocks, or None if the message could not be matched.
+    Update one founder-voice task (section + actions). Other tasks unchanged.
     """
+    if not blocks:
+        return None
+
+    if actions_block_index is not None:
+        i = actions_block_index
+        if i < 0 or i >= len(blocks) or blocks[i].get("type") != "actions":
+            return None
+        section_idx = i - 1
+        if section_idx >= 0 and blocks[section_idx].get("type") == "divider":
+            section_idx -= 1
+        if section_idx < 0 or blocks[section_idx].get("type") != "section":
+            return None
+        section_text = blocks[section_idx].get("text", {}).get("text", "")
+        body = format_task_section(task_details) if task_details else section_text
+        updated = list(blocks[:section_idx])
+        updated.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"{body}\n\n{status_line}"},
+        })
+        divider_idx = section_idx + 1
+        if divider_idx < i and blocks[divider_idx].get("type") == "divider":
+            updated.append(blocks[divider_idx])
+        updated.extend(blocks[i + 1:])
+        return updated
+
     target = target_brief.strip()
-    if not blocks or not target:
+    if not target and task_index is None:
         return None
 
     updated: list = []
@@ -210,18 +307,17 @@ def mark_task_in_blocks(
             block.get("type") == "section"
             and i + 1 < len(blocks)
             and blocks[i + 1].get("type") == "actions"
+            and is_founder_approval_block(blocks[i + 1])
         ):
             actions_block = blocks[i + 1]
-            section_text = block.get("text", {}).get("text", "")
-            if actions_block_matches_brief(actions_block, section_text, target):
+            if actions_block_matches_task(
+                actions_block, target, target_title, task_index
+            ):
                 matched = True
-                body = format_task_section(task_details) if task_details else section_text
+                body = format_task_section(task_details) if task_details else block.get("text", {}).get("text", "")
                 updated.append({
                     "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"{body}\n\n{status_line}",
-                    },
+                    "text": {"type": "mrkdwn", "text": f"{body}\n\n{status_line}"},
                 })
                 i += 2
                 if i < len(blocks) and blocks[i].get("type") == "divider":
@@ -272,6 +368,10 @@ async def update_message_after_task_action(
     title: str,
     action: str,
     task_details: dict | None = None,
+    match_title: str = "",
+    task_index: int | None = None,
+    current_blocks: list | None = None,
+    clicked_button_value: str = "",
 ):
     """Update founder-voice message after approve/reject — one task at a time."""
     status_lines = {
@@ -282,9 +382,16 @@ async def update_message_after_task_action(
     display_title = (task_details or {}).get("title") or title or match_brief
     fallback_text = f"{status_line}\n*{display_title}*"
 
-    current_blocks = await fetch_message_blocks(channel_id, message_ts)
+    blocks = current_blocks if current_blocks else await fetch_message_blocks(channel_id, message_ts)
+    actions_idx = find_founder_approval_actions_index(blocks, clicked_button_value)
     new_blocks = mark_task_in_blocks(
-        current_blocks, match_brief, status_line, task_details
+        blocks,
+        match_brief,
+        status_line,
+        task_details,
+        target_title=match_title,
+        task_index=task_index,
+        actions_block_index=actions_idx,
     )
 
     if new_blocks is not None:
@@ -308,12 +415,6 @@ async def update_message_after_task_action(
 
     if not ok:
         print(f"Failed to update founder message for brief={match_brief!r}")
-
-
-def is_status_action_block(actions_block: dict) -> bool:
-    """True if this actions block has Mark In Progress / Mark Done buttons."""
-    action_ids = {el.get("action_id") for el in actions_block.get("elements", [])}
-    return "mark_in_progress" in action_ids or "mark_done" in action_ids
 
 
 def mark_status_in_blocks_by_action(
@@ -388,7 +489,7 @@ def mark_assignee_task_in_blocks(
                 and is_status_action_block(blocks[actions_idx])
             ):
                 actions_block = blocks[actions_idx]
-                if actions_block_matches_brief(actions_block, section_text, target):
+                if actions_block_matches_task(actions_block, target):
                     matched = True
                     updated.append({
                         "type": "section",
@@ -648,6 +749,7 @@ async def open_edit_modal(
     task: dict,
     channel_id: str,
     message_ts: str,
+    edit_button_value: str = "",
 ):
     """Open a Slack modal so the Founder can edit task fields inline."""
     task = normalize_task(task)
@@ -719,6 +821,9 @@ async def open_edit_modal(
             "callback_id": "edit_task_modal",
             "private_metadata": json.dumps({
                 "original_brief": task["brief"],
+                "original_title": task["title"],
+                "task_index": task.get("task_index"),
+                "edit_button_value": edit_button_value,
                 "channel_id": channel_id,
                 "message_ts": message_ts,
             }),
@@ -765,8 +870,11 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 "deadline": normalize_deadline_input(
                     values.get("deadline_block", {}).get("deadline", {}).get("value") or ""
                 ),
+                "task_index": meta.get("task_index"),
             }
             original_brief = meta.get("original_brief") or meta.get("brief") or edited_task["brief"]
+            original_title = meta.get("original_title", "")
+            task_index = meta.get("task_index")
             channel_id = meta.get("channel_id", "")
             message_ts = meta.get("message_ts", "")
 
@@ -777,6 +885,9 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 edited_task["title"],
                 "approved",
                 task_details=edited_task,
+                match_title=original_title,
+                task_index=task_index,
+                clicked_button_value=meta.get("edit_button_value", ""),
             )
             background_tasks.add_task(finalize_edit_approval, edited_task)
             return JSONResponse(content={})
@@ -785,12 +896,14 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
     if payload_type == "block_actions":
         action = payload["actions"][0]
         action_id = action["action_id"]
-        action_value = json.loads(action.get("value", "{}"))
+        raw_button_value = action.get("value", "{}")
+        action_value = json.loads(raw_button_value)
         task = resolve_task(action_value, payload)
         brief = task["brief"]
         user_id = payload["user"]["id"]
+        message_blocks = payload.get("message", {}).get("blocks", [])
 
-        print(f"Slack action: {action_id} brief={brief!r}")
+        print(f"Slack action: {action_id} brief={brief!r} task_index={task.get('task_index')!r}")
 
         if action_id == "approve_task":
             await update_message_after_task_action(
@@ -800,6 +913,10 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 task["title"],
                 "approved",
                 task_details=task,
+                match_title=task["title"],
+                task_index=task.get("task_index"),
+                current_blocks=message_blocks,
+                clicked_button_value=raw_button_value,
             )
             background_tasks.add_task(send_task_approved_to_n8n, dict(task))
 
@@ -809,6 +926,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 task=task,
                 channel_id=payload["channel"]["id"],
                 message_ts=payload["message"]["ts"],
+                edit_button_value=raw_button_value,
             )
 
         elif action_id == "reject_task":
@@ -822,6 +940,10 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 brief,
                 task["title"],
                 "rejected",
+                match_title=task["title"],
+                task_index=task.get("task_index"),
+                current_blocks=message_blocks,
+                clicked_button_value=raw_button_value,
             )
 
         elif action_id == "mark_in_progress":
