@@ -10,6 +10,7 @@ import hmac
 import hashlib
 import time
 import re
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 import httpx
@@ -684,6 +685,7 @@ async def prepare_approved_task_payload(task: dict) -> dict:
     if re.match(r"^U[A-Z0-9]+$", existing_id, re.I):
         payload["assignee_slack_id"] = existing_id
         payload["assignee"] = await slack_user_display_name(existing_id)
+        payload["deadline"] = normalize_deadline_to_iso(payload.get("deadline", ""))
         return payload
 
     name_hint, id_from_name = parse_assignee_field(payload.get("assignee", ""))
@@ -706,6 +708,7 @@ async def prepare_approved_task_payload(task: dict) -> dict:
             f"prepare_approved_task_payload: no Slack ID for assignee={payload['assignee']!r}"
         )
 
+    payload["deadline"] = normalize_deadline_to_iso(payload.get("deadline", ""))
     return payload
 
 
@@ -792,12 +795,34 @@ def deadline_for_modal(deadline: str) -> str:
     return value
 
 
-def normalize_deadline_input(deadline: str) -> str:
-    """Clean deadline from modal submit."""
+def normalize_deadline_to_iso(deadline: str) -> str:
+    """Normalize deadline to YYYY-MM-DD for Airtable/n8n (expects DD/MM/YYYY input)."""
     value = (deadline or "").strip()
-    if value.lower() in ("not specified", "none", "n/a", "-"):
+    if not value or value.lower() in ("not specified", "none", "n/a", "-"):
         return ""
+
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return value
+        except ValueError:
+            pass
+
+    for fmt in (
+        "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+        "%d/%m/%y", "%d-%m-%y", "%d.%m.%y",
+    ):
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except ValueError:
+            continue
+
     return value
+
+
+def normalize_deadline_input(deadline: str) -> str:
+    """Clean and ISO-normalize deadline from modal submit."""
+    return normalize_deadline_to_iso(deadline)
 
 
 async def build_assignee_select(task: dict) -> dict:
